@@ -22,11 +22,12 @@ use crate::{
 pub struct AlbumArtFacade {
     image_backend: ImageBackend,
     current_album_art: Option<Arc<Vec<u8>>>,
+    current_album_art_is_animated: bool,
     default_album_art: Arc<Vec<u8>>,
     last_size: Rect,
     work_tx: Sender<WorkRequest>,
     is_showing: bool,
-    request_queue: Vec<Arc<Vec<u8>>>,
+    request_queue: Vec<PendingRequest>,
 }
 
 #[derive(Debug, Default)]
@@ -51,6 +52,16 @@ pub enum EncodeData {
     Empty,
 }
 
+#[derive(derive_more::Debug, Clone)]
+enum PendingRequest {
+    Static(#[debug(skip)] Arc<Vec<u8>>),
+    Rotated {
+        #[debug(skip)]
+        data: Arc<Vec<u8>>,
+        angle_degrees: f32,
+    },
+}
+
 impl AlbumArtFacade {
     pub fn new(ctx: &Ctx) -> Self {
         let config = ctx.config.as_ref();
@@ -67,6 +78,7 @@ impl AlbumArtFacade {
         Self {
             image_backend,
             current_album_art: None,
+            current_album_art_is_animated: false,
             last_size: Rect::default(),
             default_album_art: Arc::new(config.theme.default_album_art.to_vec()),
             work_tx: ctx.work_sender.clone(),
@@ -76,8 +88,13 @@ impl AlbumArtFacade {
     }
 
     pub fn show_default(&mut self, ctx: &Ctx) -> Result<()> {
-        self.current_album_art = Some(Arc::clone(&self.default_album_art));
+        self.use_default_album_art();
         self.show_current(ctx)
+    }
+
+    pub fn show_default_rotated(&mut self, angle_degrees: f32, ctx: &Ctx) -> Result<()> {
+        self.use_default_album_art();
+        self.show_rotated_current(angle_degrees, ctx)
     }
 
     pub fn show_current(&mut self, ctx: &Ctx) -> Result<()> {
@@ -86,80 +103,58 @@ impl AlbumArtFacade {
             return Ok(());
         };
 
-        self.show(current_album_art, ctx)?;
+        self.submit_request(PendingRequest::Static(current_album_art), ctx)?;
 
         Ok(())
     }
 
-    pub fn show(&mut self, data: impl Into<Arc<Vec<u8>>>, ctx: &Ctx) -> Result<()> {
-        self.is_showing = true;
-
-        let max_size = ctx.config.album_art.max_size_px;
-        let halign = ctx.config.album_art.horizontal_align;
-        let valign = ctx.config.album_art.vertical_align;
-        let size = self.last_size;
-
-        let data = data.into();
-        self.current_album_art = Some(Arc::clone(&data));
-
-        self.request_queue.push(Arc::clone(&data));
-        if self.request_queue.len() > 1 {
-            log::debug!("Image encode request already in flight, queueing the new one.");
+    pub fn show_rotated_current(&mut self, angle_degrees: f32, ctx: &Ctx) -> Result<()> {
+        let Some(current_album_art) = self.current_album_art.as_ref().map(Arc::clone) else {
+            log::warn!("Tried to display rotated album art but none was present");
             return Ok(());
+        };
+
+        if self.current_album_art_is_animated || !self.is_kitty_backend() {
+            return self.show_current(ctx);
         }
 
-        match &mut self.image_backend {
-            ImageBackend::Kitty(_kitty) => {
-                self.work_tx.send(WorkRequest::ResizeImage(Box::new(move || {
-                    Ok(EncodeData::Kitty(Kitty::create_data(
-                        &data, size, max_size, halign, valign,
-                    )?))
-                })))?;
-            }
-            ImageBackend::Iterm2(_iterm2) => {
-                self.work_tx.send(WorkRequest::ResizeImage(Box::new(move || {
-                    Ok(EncodeData::Iterm2(Iterm2::create_data(
-                        &data, size, max_size, halign, valign,
-                    )?))
-                })))?;
-            }
-            ImageBackend::Sixel(_sixel) => {
-                log::debug!("Sending sixel image encode request");
-                self.work_tx.send(WorkRequest::ResizeImage(Box::new(move || {
-                    Ok(EncodeData::Sixel(Sixel::create_data(
-                        &data, size, max_size, halign, valign,
-                    )?))
-                })))?;
-            }
-            ImageBackend::Block(_block) => {
-                self.work_tx.send(WorkRequest::ResizeImage(Box::new(move || {
-                    Ok(EncodeData::Block(Block::create_data(
-                        &data, size, max_size, halign, valign,
-                    )?))
-                })))?;
-            }
-            ImageBackend::Ueberzug(_ueberzug) => {
-                self.work_tx.send(WorkRequest::ResizeImage(Box::new(move || {
-                    Ok(EncodeData::Ueberzug(Ueberzug::create_data(
-                        &data, size, max_size, halign, valign,
-                    )?))
-                })))?;
-            }
-            ImageBackend::None => {}
-        }
+        self.submit_request(PendingRequest::Rotated { data: current_album_art, angle_degrees }, ctx)
+    }
 
-        Ok(())
+    pub fn show(&mut self, data: impl Into<Arc<Vec<u8>>>, ctx: &Ctx) -> Result<()> {
+        let data = data.into();
+        self.replace_current(data);
+        self.show_current(ctx)
+    }
+
+    pub fn show_rotated(
+        &mut self,
+        data: impl Into<Arc<Vec<u8>>>,
+        angle_degrees: f32,
+        ctx: &Ctx,
+    ) -> Result<()> {
+        let data = data.into();
+        self.replace_current(data);
+        self.show_rotated_current(angle_degrees, ctx)
+    }
+
+    pub fn current_album_art_is_animated(&self) -> bool {
+        self.current_album_art_is_animated
+    }
+
+    pub fn has_current_album_art(&self) -> bool {
+        self.current_album_art.is_some()
+    }
+
+    pub fn is_kitty_backend(&self) -> bool {
+        matches!(self.image_backend, ImageBackend::Kitty(_))
     }
 
     pub fn image_processing_failed(&mut self, err: &anyhow::Error, ctx: &Ctx) -> Result<()> {
         status_error!("Failed to process album art image: {err:?}");
 
-        if let Some(req_data) = self.request_queue.pop()
-            && !self.request_queue.is_empty()
-        {
-            log::debug!("More image requests in queue, encoding the latest one instead");
-            self.request_queue.clear();
-            self.show(req_data, ctx)?;
+        if self.run_next_queued_request(ctx)? {
+            return Ok(());
         }
         Ok(())
     }
@@ -171,12 +166,7 @@ impl AlbumArtFacade {
             return Ok(());
         }
 
-        if let Some(req_data) = self.request_queue.pop()
-            && !self.request_queue.is_empty()
-        {
-            log::debug!("More image requests in queue, encoding the latest one instead");
-            self.request_queue.clear();
-            self.show(req_data, ctx)?;
+        if self.run_next_queued_request(ctx)? {
             return Ok(());
         }
 
@@ -256,5 +246,105 @@ impl AlbumArtFacade {
 
     pub fn set_size(&mut self, area: Rect) {
         self.last_size = area;
+    }
+
+    fn replace_current(&mut self, data: Arc<Vec<u8>>) {
+        self.current_album_art_is_animated = Kitty::is_animated_image(&data).unwrap_or(false);
+        self.current_album_art = Some(data);
+    }
+
+    fn use_default_album_art(&mut self) {
+        self.replace_current(Arc::clone(&self.default_album_art));
+    }
+
+    fn submit_request(&mut self, request: PendingRequest, ctx: &Ctx) -> Result<()> {
+        self.is_showing = true;
+        self.request_queue.push(request);
+        if self.request_queue.len() > 1 {
+            log::debug!("Image encode request already in flight, queueing the new one.");
+            return Ok(());
+        }
+
+        let request = self.request_queue.last().cloned().expect("queue to contain one request");
+        self.dispatch_request(request, ctx)
+    }
+
+    fn dispatch_request(&mut self, request: PendingRequest, ctx: &Ctx) -> Result<()> {
+        let max_size = ctx.config.album_art.max_size_px;
+        let halign = ctx.config.album_art.horizontal_align;
+        let valign = ctx.config.album_art.vertical_align;
+        let size = self.last_size;
+
+        match (&mut self.image_backend, request) {
+            (ImageBackend::Kitty(_kitty), PendingRequest::Static(data)) => {
+                self.work_tx.send(WorkRequest::ResizeImage(Box::new(move || {
+                    Ok(EncodeData::Kitty(Kitty::create_data(
+                        &data, size, max_size, halign, valign,
+                    )?))
+                })))?;
+            }
+            (ImageBackend::Kitty(_kitty), PendingRequest::Rotated { data, angle_degrees }) => {
+                self.work_tx.send(WorkRequest::ResizeImage(Box::new(move || {
+                    Ok(EncodeData::Kitty(Kitty::create_rotated_data(
+                        &data,
+                        size,
+                        max_size,
+                        halign,
+                        valign,
+                        angle_degrees,
+                    )?))
+                })))?;
+            }
+            (ImageBackend::Iterm2(_iterm2), PendingRequest::Static(data))
+            | (ImageBackend::Iterm2(_iterm2), PendingRequest::Rotated { data, .. }) => {
+                self.work_tx.send(WorkRequest::ResizeImage(Box::new(move || {
+                    Ok(EncodeData::Iterm2(Iterm2::create_data(
+                        &data, size, max_size, halign, valign,
+                    )?))
+                })))?;
+            }
+            (ImageBackend::Sixel(_sixel), PendingRequest::Static(data))
+            | (ImageBackend::Sixel(_sixel), PendingRequest::Rotated { data, .. }) => {
+                log::debug!("Sending sixel image encode request");
+                self.work_tx.send(WorkRequest::ResizeImage(Box::new(move || {
+                    Ok(EncodeData::Sixel(Sixel::create_data(
+                        &data, size, max_size, halign, valign,
+                    )?))
+                })))?;
+            }
+            (ImageBackend::Block(_block), PendingRequest::Static(data))
+            | (ImageBackend::Block(_block), PendingRequest::Rotated { data, .. }) => {
+                self.work_tx.send(WorkRequest::ResizeImage(Box::new(move || {
+                    Ok(EncodeData::Block(Block::create_data(
+                        &data, size, max_size, halign, valign,
+                    )?))
+                })))?;
+            }
+            (ImageBackend::Ueberzug(_ueberzug), PendingRequest::Static(data))
+            | (ImageBackend::Ueberzug(_ueberzug), PendingRequest::Rotated { data, .. }) => {
+                self.work_tx.send(WorkRequest::ResizeImage(Box::new(move || {
+                    Ok(EncodeData::Ueberzug(Ueberzug::create_data(
+                        &data, size, max_size, halign, valign,
+                    )?))
+                })))?;
+            }
+            (ImageBackend::None, _) => {}
+        }
+
+        Ok(())
+    }
+
+    fn run_next_queued_request(&mut self, ctx: &Ctx) -> Result<bool> {
+        if let Some(request) = self.request_queue.pop()
+            && !self.request_queue.is_empty()
+        {
+            log::debug!("More image requests in queue, encoding the latest one instead");
+            self.request_queue.clear();
+            self.request_queue.push(request.clone());
+            self.dispatch_request(request, ctx)?;
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 }

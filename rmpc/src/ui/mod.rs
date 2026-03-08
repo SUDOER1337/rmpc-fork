@@ -1087,6 +1087,7 @@ pub enum UiEvent {
     LyricsIndexed,
     SongChanged,
     Reconnected,
+    AlbumArtRotationTick,
     TabChanged(TabName),
     Displayed,
     Hidden,

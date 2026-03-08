@@ -1,4 +1,7 @@
-use std::{io::Write, time::Instant};
+use std::{
+    io::{Cursor, Write},
+    time::Instant,
+};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -7,6 +10,7 @@ use crossterm::{
     style::{Colors, SetColors},
 };
 use flate2::Compression;
+use image::{DynamicImage, Rgba, RgbaImage};
 use itertools::Itertools;
 use ratatui::prelude::{IntoCrossterm, Rect};
 
@@ -112,24 +116,149 @@ impl Backend for Kitty {
             }))
         } else {
             let (image, aligned_area) = resize_image(image_data, area, max_size, halign, valign)?;
-
-            let mut e = flate2::write::ZlibEncoder::new(Vec::new(), Compression::new(6));
-            e.write_all(image.to_rgba8().as_raw())
-                .context("Error occurred when writing image bytes to zlib encoder")?;
-
-            let content = base64::engine::general_purpose::STANDARD.encode(
-                e.finish().context("Error occurred when flushing image bytes to zlib encoder")?,
-            );
-
-            log::debug!(input_bytes = image_data.len(), compressed_bytes = content.len(), duration:? = start_time.elapsed(); "Image data compression finished");
-            Ok(Data::ImageData(ImageData {
-                content,
-                aligned_area: aligned_area.area,
-                img_width: image.width(),
-                img_height: image.height(),
-            }))
+            let result = encode_single_frame(image.to_rgba8(), aligned_area.area)?;
+            log::debug!(input_bytes = image_data.len(), duration:? = start_time.elapsed(); "Image data compression finished");
+            Ok(result)
         }
     }
+}
+
+impl Kitty {
+    pub fn is_animated_image(image_data: &[u8]) -> Result<bool> {
+        Ok(get_gif_frames(image_data)?.is_some())
+    }
+
+    pub fn create_rotated_data(
+        image_data: &[u8],
+        area: Rect,
+        max_size: Size,
+        halign: HorizontalAlign,
+        valign: VerticalAlign,
+        angle_degrees: f32,
+    ) -> Result<Data> {
+        if Self::is_animated_image(image_data)? {
+            return Self::create_data(image_data, area, max_size, halign, valign);
+        }
+
+        let image = image::ImageReader::new(Cursor::new(image_data))
+            .with_guessed_format()
+            .context("Unable to guess image format")?
+            .decode()
+            .context("Unable to decode image")?;
+
+        let aligned_area = create_aligned_area(area, (1, 1), max_size, halign, valign);
+        let target_size = u32::from(aligned_area.size_px.width.min(aligned_area.size_px.height));
+        if target_size == 0 {
+            return Ok(Data::ImageData(ImageData {
+                content: String::new(),
+                img_width: 0,
+                img_height: 0,
+                aligned_area: aligned_area.area,
+            }));
+        }
+
+        let cropped = crop_center_square(&image);
+        let mut circular = cropped
+            .resize_exact(target_size, target_size, image::imageops::FilterType::Lanczos3)
+            .to_rgba8();
+        apply_circular_mask(&mut circular);
+        let rotated = rotate_rgba(&circular, angle_degrees);
+
+        encode_single_frame(rotated, aligned_area.area)
+    }
+}
+
+fn encode_single_frame(image: RgbaImage, aligned_area: Rect) -> Result<Data> {
+    let img_width = image.width();
+    let img_height = image.height();
+    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), Compression::new(6));
+    e.write_all(image.as_raw())
+        .context("Error occurred when writing image bytes to zlib encoder")?;
+
+    let content = base64::engine::general_purpose::STANDARD.encode(
+        e.finish().context("Error occurred when flushing image bytes to zlib encoder")?,
+    );
+
+    Ok(Data::ImageData(ImageData { content, aligned_area, img_width, img_height }))
+}
+
+fn crop_center_square(image: &DynamicImage) -> DynamicImage {
+    let size = image.width().min(image.height());
+    let x = (image.width() - size) / 2;
+    let y = (image.height() - size) / 2;
+    image.crop_imm(x, y, size, size)
+}
+
+fn apply_circular_mask(image: &mut RgbaImage) {
+    let center = (image.width() as f32 - 1.0) * 0.5;
+    let radius = image.width() as f32 * 0.5;
+    let feather = (radius * 0.02).max(1.0);
+
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let dx = x as f32 - center;
+        let dy = y as f32 - center;
+        let distance = (dx * dx + dy * dy).sqrt();
+
+        let alpha_scale = if distance >= radius {
+            0.0
+        } else if distance > radius - feather {
+            (radius - distance) / feather
+        } else {
+            1.0
+        };
+
+        pixel.0[3] = ((pixel.0[3] as f32) * alpha_scale).round() as u8;
+    }
+}
+
+fn rotate_rgba(image: &RgbaImage, angle_degrees: f32) -> RgbaImage {
+    let width = image.width();
+    let height = image.height();
+    let mut rotated = RgbaImage::new(width, height);
+    let center = (width as f32 - 1.0) * 0.5;
+    let radius = width as f32 * 0.5;
+    let radians = angle_degrees.to_radians();
+    let cos_a = radians.cos();
+    let sin_a = radians.sin();
+
+    for y in 0..height {
+        for x in 0..width {
+            let nx = (x as f32 - center) / radius;
+            let ny = (y as f32 - center) / radius;
+            let src_x = (cos_a * nx + sin_a * ny) * radius + center;
+            let src_y = (-sin_a * nx + cos_a * ny) * radius + center;
+            rotated.put_pixel(x, y, sample_bilinear(image, src_x, src_y));
+        }
+    }
+
+    rotated
+}
+
+fn sample_bilinear(image: &RgbaImage, x: f32, y: f32) -> Rgba<u8> {
+    if x < 0.0 || y < 0.0 || x > (image.width() - 1) as f32 || y > (image.height() - 1) as f32 {
+        return Rgba([0, 0, 0, 0]);
+    }
+
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(image.width() - 1);
+    let y1 = (y0 + 1).min(image.height() - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+
+    let p00 = image.get_pixel(x0, y0).0;
+    let p10 = image.get_pixel(x1, y0).0;
+    let p01 = image.get_pixel(x0, y1).0;
+    let p11 = image.get_pixel(x1, y1).0;
+
+    let mut out = [0u8; 4];
+    for i in 0..4 {
+        let top = p00[i] as f32 * (1.0 - fx) + p10[i] as f32 * fx;
+        let bottom = p01[i] as f32 * (1.0 - fx) + p11[i] as f32 * fx;
+        out[i] = (top * (1.0 - fy) + bottom * fy).round() as u8;
+    }
+
+    Rgba(out)
 }
 
 fn create_unicode_placeholder_grid(

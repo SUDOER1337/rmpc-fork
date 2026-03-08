@@ -138,6 +138,7 @@ pub(crate) enum AppEvent {
     },
     Log(Vec<u8>),
     IdleEvent(IdleEvent),
+    AlbumArtRotationTick,
     RequestRender,
     Resized {
         columns: u16,

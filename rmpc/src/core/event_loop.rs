@@ -323,6 +323,11 @@ fn main_task<B: Backend + std::io::Write>(
                     }
                     render_wanted = true;
                 }
+                AppEvent::AlbumArtRotationTick => {
+                    if let Err(err) = ui.on_event(UiEvent::AlbumArtRotationTick, &mut ctx) {
+                        log::error!(error:? = err; "UI failed to handle album art rotation tick");
+                    }
+                }
                 AppEvent::RequestRender => {
                     render_wanted = true;
                 }

@@ -217,6 +217,7 @@ where
 }
 
 /// Cancels the task when dropped
+#[derive(Debug)]
 pub(crate) struct TaskGuard<T> {
     id: Id,
     job_tx: Sender<SchedulerCommand<T>>,

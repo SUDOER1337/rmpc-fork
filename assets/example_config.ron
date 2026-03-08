@@ -28,10 +28,13 @@
     quit_closes_modal: false,
     album_art: (
         method: Auto,
+        effect: Static,
         max_size_px: (width: 1200, height: 1200),
         disabled_protocols: ["http://", "https://"],
         vertical_align: Center,
         horizontal_align: Center,
+        rotation_speed_dps: 8.0,
+        rotation_fps: 6,
     ),
     keybinds: (
         global: {
